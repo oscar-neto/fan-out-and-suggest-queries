@@ -202,8 +202,21 @@ def mine_google_suggest(seeds: list[str], hl: str, gl: str, lang: str,
 
 
 # ---------------------------------------------------------------------------
-# Query fan-out via LLM (Anthropic API)
+# Query fan-out via LLM (Anthropic API or Google AI Studio / Gemini API)
 # ---------------------------------------------------------------------------
+PROVIDERS = {
+    "Anthropic (Claude)": {
+        "id": "anthropic",
+        "models": ["claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
+        "key_help": "Get your key at console.anthropic.com",
+    },
+    "Google AI Studio (Gemini)": {
+        "id": "google",
+        "models": ["gemini-flash-latest", "gemini-3.5-flash", "gemini-2.5-pro"],
+        "key_help": "Get your key at aistudio.google.com/apikey",
+    },
+}
+
 FANOUT_SYSTEM = """You are a query fan-out engine that faithfully replicates the query
 decomposition behavior of two systems:
 
@@ -245,35 +258,65 @@ Rules:
 - No duplicates, no overly generic queries."""
 
 
-def generate_fanouts(seeds: list[str], api_key: str, lang: str,
-                     n_per_type: int, business_context: str,
-                     model: str, progress_cb=None) -> pd.DataFrame:
-    """Call the Anthropic API to generate fan-outs for each seed."""
-    rows = []
+def call_anthropic(prompt: str, api_key: str, model: str) -> str:
+    """Call the Anthropic Messages API and return the raw text response."""
     headers = {
         "x-api-key": api_key,
         "anthropic-version": "2023-06-01",
         "content-type": "application/json",
     }
+    payload = {
+        "model": model,
+        "max_tokens": 4000,
+        "system": FANOUT_SYSTEM,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    r = requests.post("https://api.anthropic.com/v1/messages",
+                      headers=headers, json=payload, timeout=120)
+    r.raise_for_status()
+    return "".join(
+        block.get("text", "")
+        for block in r.json().get("content", [])
+        if block.get("type") == "text"
+    )
+
+
+def call_gemini(prompt: str, api_key: str, model: str) -> str:
+    """Call the Gemini API (Google AI Studio key) and return the raw text response."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    headers = {
+        "x-goog-api-key": api_key,
+        "content-type": "application/json",
+    }
+    payload = {
+        "system_instruction": {"parts": [{"text": FANOUT_SYSTEM}]},
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "maxOutputTokens": 8192,
+            "responseMimeType": "application/json",
+        },
+    }
+    r = requests.post(url, headers=headers, json=payload, timeout=120)
+    r.raise_for_status()
+    candidates = r.json().get("candidates", [])
+    if not candidates:
+        return ""
+    parts = candidates[0].get("content", {}).get("parts", [])
+    return "".join(p.get("text", "") for p in parts if "text" in p)
+
+
+def generate_fanouts(seeds: list[str], provider_id: str, api_key: str, lang: str,
+                     n_per_type: int, business_context: str,
+                     model: str, progress_cb=None) -> pd.DataFrame:
+    """Generate fan-outs for each seed using the selected LLM provider."""
+    rows = []
+    call_fn = call_anthropic if provider_id == "anthropic" else call_gemini
 
     for i, seed in enumerate(seeds, start=1):
-        payload = {
-            "model": model,
-            "max_tokens": 4000,
-            "system": FANOUT_SYSTEM,
-            "messages": [
-                {"role": "user",
-                 "content": build_fanout_prompt(seed, lang, n_per_type, business_context)}
-            ],
-        }
         try:
-            r = requests.post("https://api.anthropic.com/v1/messages",
-                              headers=headers, json=payload, timeout=120)
-            r.raise_for_status()
-            text = "".join(
-                block.get("text", "")
-                for block in r.json().get("content", [])
-                if block.get("type") == "text"
+            text = call_fn(
+                build_fanout_prompt(seed, lang, n_per_type, business_context),
+                api_key, model,
             )
             # defensive cleanup of code fences
             text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
@@ -337,9 +380,11 @@ delay = st.sidebar.slider("Delay between requests (seconds)", 0.1, 2.0, (0.2, 0.
 
 st.sidebar.divider()
 st.sidebar.subheader("Query Fan-out (LLM)")
-api_key = st.sidebar.text_input("Anthropic API Key", type="password",
-                                help="Only required for the fan-out tab.")
-model = st.sidebar.selectbox("Model", ["claude-sonnet-4-6", "claude-haiku-4-5-20251001"], index=0)
+provider_name = st.sidebar.selectbox("LLM provider", list(PROVIDERS.keys()), index=0)
+provider = PROVIDERS[provider_name]
+api_key = st.sidebar.text_input(f"{provider_name} API Key", type="password",
+                                help=f"Only required for the fan-out tab. {provider['key_help']}.")
+model = st.sidebar.selectbox("Model", provider["models"], index=0)
 n_per_type = st.sidebar.slider("Fan-outs per type", 3, 15, 8)
 business_context = st.sidebar.text_area(
     "Business context (optional)",
@@ -412,15 +457,17 @@ with tab_fanout:
         bar = st.progress(0.0, text="Starting...")
         cb = lambda p, msg: bar.progress(min(p, 1.0), text=msg)
         with st.spinner("Generating fan-outs via LLM..."):
-            df_fan = generate_fanouts(seeds, api_key, lang, n_per_type,
-                                      business_context, model, progress_cb=cb)
+            df_fan = generate_fanouts(seeds, provider["id"], api_key, lang,
+                                      n_per_type, business_context, model,
+                                      progress_cb=cb)
         bar.empty()
         st.session_state["df_fanout"] = df_fan
         if not df_fan.empty:
             st.success(f"{len(df_fan)} fan-outs generated.")
 
     if not api_key:
-        st.info("Enter your Anthropic API Key in the sidebar to enable this engine.")
+        st.info("Select your LLM provider (Anthropic or Google AI Studio) and enter the "
+                "corresponding API key in the sidebar to enable this engine.")
 
     if "df_fanout" in st.session_state and not st.session_state["df_fanout"].empty:
         df = st.session_state["df_fanout"]
