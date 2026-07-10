@@ -212,7 +212,7 @@ PROVIDERS = {
     },
     "Google AI Studio (Gemini)": {
         "id": "google",
-        "models": ["gemini-flash-latest", "gemini-3.5-flash", "gemini-2.5-pro"],
+        "models": ["gemini-2.5-flash", "gemini-flash-latest", "gemini-3.5-flash", "gemini-2.5-pro"],
         "key_help": "Get your key at aistudio.google.com/apikey",
     },
 }
@@ -305,19 +305,57 @@ def call_gemini(prompt: str, api_key: str, model: str) -> str:
     return "".join(p.get("text", "") for p in parts if "text" in p)
 
 
+RETRYABLE_STATUS = {429, 500, 502, 503, 529}  # rate limit / overloaded / transient
+MAX_RETRIES = 4
+
+
+def call_with_retry(call_fn, prompt: str, api_key: str, model: str,
+                    status_cb=None) -> str:
+    """Call an LLM provider with exponential backoff on transient errors."""
+    last_err = None
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            return call_fn(prompt, api_key, model)
+        except requests.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status not in RETRYABLE_STATUS or attempt == MAX_RETRIES:
+                raise
+            last_err = e
+            # honor Retry-After when present, otherwise exponential backoff + jitter
+            retry_after = e.response.headers.get("retry-after") if e.response is not None else None
+            try:
+                wait = float(retry_after)
+            except (TypeError, ValueError):
+                wait = (2 ** attempt) * 2 + random.uniform(0, 1.5)  # 2s, 4s, 8s, 16s...
+            if status_cb:
+                status_cb(f"⏳ Provider returned {status} (high demand). "
+                          f"Retry {attempt + 1}/{MAX_RETRIES} in {wait:.0f}s...")
+            time.sleep(wait)
+        except requests.ConnectionError as e:
+            if attempt == MAX_RETRIES:
+                raise
+            last_err = e
+            time.sleep((2 ** attempt) * 2)
+    raise last_err  # pragma: no cover
+
+
 def generate_fanouts(seeds: list[str], provider_id: str, api_key: str, lang: str,
                      n_per_type: int, business_context: str,
                      model: str, progress_cb=None) -> pd.DataFrame:
     """Generate fan-outs for each seed using the selected LLM provider."""
     rows = []
     call_fn = call_anthropic if provider_id == "anthropic" else call_gemini
+    status_box = st.empty()
 
     for i, seed in enumerate(seeds, start=1):
         try:
-            text = call_fn(
+            text = call_with_retry(
+                call_fn,
                 build_fanout_prompt(seed, lang, n_per_type, business_context),
                 api_key, model,
+                status_cb=lambda msg: status_box.caption(msg),
             )
+            status_box.empty()
             # defensive cleanup of code fences
             text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
             data = json.loads(text)
@@ -332,7 +370,13 @@ def generate_fanouts(seeds: list[str], provider_id: str, api_key: str, lang: str
                         "intent": item.get("intent", ""),
                     })
         except requests.HTTPError as e:
-            st.error(f"API error for seed '{seed}': {e.response.status_code} — {e.response.text[:300]}")
+            status = e.response.status_code if e.response is not None else "?"
+            if status in RETRYABLE_STATUS:
+                st.error(f"Seed '{seed}': provider still overloaded after {MAX_RETRIES} retries "
+                         f"({status}). Try again in a few minutes or switch to a stable, "
+                         f"lower-demand model (e.g. gemini-2.5-flash) in the sidebar.")
+            else:
+                st.error(f"API error for seed '{seed}': {status} — {e.response.text[:300]}")
         except (requests.RequestException, json.JSONDecodeError, KeyError) as e:
             st.warning(f"Failed to process seed '{seed}': {e}")
 
