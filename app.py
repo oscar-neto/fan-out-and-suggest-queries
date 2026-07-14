@@ -17,6 +17,10 @@ Two opportunity-mapping engines from a list of seed terms:
 Run locally:  streamlit run app.py
 """
 
+import hashlib
+import hmac
+import hashlib
+import hmac
 import json
 import random
 import re
@@ -47,6 +51,72 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+# ---------------------------------------------------------------------------
+# Authentication gate
+# ---------------------------------------------------------------------------
+# Credentials live in Streamlit secrets (never in code):
+#   [auth]                      <- .streamlit/secrets.toml locally, or the
+#   [auth.users]                   "Secrets" panel on Streamlit Community Cloud
+#   your_username = "<sha256 hash of the password>"
+# Generate a hash with:
+#   python -c "import hashlib,getpass;print(hashlib.sha256(getpass.getpass().encode()).hexdigest())"
+
+
+def _auth_users() -> dict:
+    try:
+        return dict(st.secrets["auth"]["users"])
+    except (KeyError, FileNotFoundError):
+        return {}
+
+
+def _verify(username: str, password: str, users: dict) -> bool:
+    stored = users.get(username.strip())
+    if not stored:
+        # burn the same time as a real check to avoid user enumeration
+        hmac.compare_digest("x" * 64, hashlib.sha256(b"x").hexdigest())
+        return False
+    supplied = hashlib.sha256(password.encode("utf-8")).hexdigest()
+    return hmac.compare_digest(supplied.lower(), str(stored).lower())
+
+
+def require_login():
+    if st.session_state.get("authenticated"):
+        return
+
+    users = _auth_users()
+    st.title("🔒 Query Opportunity Mapper")
+
+    if not users:
+        st.error(
+            "Authentication is not configured. Add authorized users to the app "
+            "secrets before using it:\n\n"
+            "```toml\n[auth.users]\nyour_username = \"<sha256 hash of the password>\"\n```\n"
+            "On Streamlit Community Cloud: app menu → **Settings** → **Secrets**. "
+            "Locally: `.streamlit/secrets.toml`. Generate the hash with:\n\n"
+            "```bash\npython -c \"import hashlib,getpass;"
+            "print(hashlib.sha256(getpass.getpass().encode()).hexdigest())\"\n```"
+        )
+        st.stop()
+
+    with st.form("login"):
+        st.subheader("Sign in")
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Sign in", type="primary",
+                                          use_container_width=True)
+    if submitted:
+        time.sleep(0.8)  # slow down brute-force attempts
+        if _verify(username, password, users):
+            st.session_state["authenticated"] = True
+            st.session_state["auth_user"] = username.strip()
+            st.rerun()
+        else:
+            st.error("Invalid username or password.")
+    st.stop()
+
+
+require_login()
 
 # ---------------------------------------------------------------------------
 # Constants — expansion modifiers (pt-BR and en)
@@ -742,6 +812,12 @@ def to_xlsx(dfs: dict[str, pd.DataFrame]) -> bytes:
 # UI — Sidebar
 # ---------------------------------------------------------------------------
 st.sidebar.title("⚙️ Settings")
+st.sidebar.caption(f"Signed in as **{st.session_state.get('auth_user', '')}**")
+if st.sidebar.button("Sign out", use_container_width=True):
+    for k in ("authenticated", "auth_user"):
+        st.session_state.pop(k, None)
+    st.rerun()
+st.sidebar.divider()
 
 lang = st.sidebar.selectbox("Expansion language", ["pt-BR", "en"], index=0)
 hl = st.sidebar.text_input("hl (Google interface language)", value="pt-BR" if lang == "pt-BR" else "en")
