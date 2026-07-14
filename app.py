@@ -248,6 +248,63 @@ CONSOLE_SCRIPT = r"""(() => {
 })();"""
 
 
+def fetch_openai_fanouts(seed: str, api_key: str, model: str) -> list[str]:
+    """Fully automated: run the seed through the OpenAI Responses API with the
+    web_search tool and return the actual search queries the model executed
+    (web_search_call -> action.query / action.queries)."""
+    r = requests.post(
+        "https://api.openai.com/v1/responses",
+        headers={"Authorization": f"Bearer {api_key}",
+                 "Content-Type": "application/json"},
+        json={
+            "model": model,
+            "input": ("Research this topic thoroughly using web search, covering "
+                      f"multiple angles, subtopics and comparisons: {seed}"),
+            "tools": [{"type": "web_search"}],
+            "tool_choice": "auto",
+        },
+        timeout=180,
+    )
+    r.raise_for_status()
+    queries = []
+    for item in r.json().get("output", []):
+        if item.get("type") == "web_search_call":
+            action = item.get("action") or {}
+            q = action.get("query")
+            if isinstance(q, str) and q.strip():
+                queries.append(q.strip())
+            for q in action.get("queries") or []:
+                if isinstance(q, str) and q.strip():
+                    queries.append(q.strip())
+    return queries
+
+
+def fetch_gemini_grounding_fanouts(seed: str, api_key: str, model: str) -> list[str]:
+    """Fully automated: run the seed through the Gemini API with Google Search
+    grounding and return the actual queries Google executed
+    (groundingMetadata.webSearchQueries)."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    r = requests.post(
+        url,
+        headers={"x-goog-api-key": api_key, "content-type": "application/json"},
+        json={
+            "contents": [{"parts": [{"text":
+                ("Research this topic thoroughly using Google Search, covering "
+                 f"multiple angles, subtopics and comparisons: {seed}")}]}],
+            "tools": [{"google_search": {}}],
+        },
+        timeout=180,
+    )
+    r.raise_for_status()
+    queries = []
+    for cand in r.json().get("candidates", []):
+        gm = cand.get("groundingMetadata") or {}
+        for q in gm.get("webSearchQueries") or []:
+            if isinstance(q, str) and q.strip():
+                queries.append(q.strip())
+    return queries
+
+
 CHATGPT_CONSOLE_SCRIPT = r"""(async () => {
   const id = (location.pathname.split('/c/')[1] || '').split('/')[0];
   if (!id) { console.log('Open a ChatGPT conversation first (URL must contain /c/...).'); return; }
@@ -837,14 +894,75 @@ with tab_fanout:
 # ---- Tab 3: Observed fan-outs (free capture from the real interface) ----
 with tab_observed:
     st.markdown(
-        "Captures **real fan-out queries exposed by the Google AI Mode interface** — "
-        "no LLM simulation, no external APIs, no paid tools. After the AI Mode answer "
-        "finishes loading, the executed sub-queries are embedded in the page as search "
-        "links and streamed payload data. Two free routes to extract them from your "
-        "own browsing session:"
+        "Captures **real fan-out queries** executed by search-powered AI systems — "
+        "no LLM simulation. Three routes, from fully automated to fully manual."
     )
 
-    st.markdown("##### Route 1 — DevTools console scripts (recommended)")
+    st.markdown("##### Route 1 — Fully automated (official APIs) ⚡")
+    st.markdown(
+        "Seed in → real executed queries out, zero browser steps. The **OpenAI "
+        "Responses API** (`web_search` tool) returns every search the model actually "
+        "ran (`web_search_call.action`), same search stack as ChatGPT. The **Gemini "
+        "API** with Google Search grounding returns `webSearchQueries` — the real "
+        "queries Google executed (free tier works). Direct automation of chatgpt.com "
+        "itself isn't offered: it requires your logged-in session and violates "
+        "OpenAI's terms — the API is the official equivalent."
+    )
+    a1, a2 = st.columns(2)
+    openai_key = a1.text_input("OpenAI API Key (ChatGPT fan-outs)", type="password",
+                               help="platform.openai.com/api-keys — web_search tool "
+                                    "calls cost a few cents per seed.")
+    openai_model = a1.text_input("OpenAI model", value="gpt-5-mini",
+                                 help="Any model supporting the web_search tool.")
+    gemini_obs_key = a2.text_input("Google AI Studio Key (Google fan-outs)", type="password",
+                                   help="aistudio.google.com/apikey — same key used "
+                                        "for fan-out generation works.")
+    gemini_obs_model = a2.text_input("Gemini model", value="gemini-flash-latest")
+
+    if st.button("▶️ Run Automated Extraction", type="primary",
+                 disabled=not (seeds and (openai_key or gemini_obs_key))):
+        bar = st.progress(0.0, text="Starting...")
+        auto_rows = []
+        for i, seed in enumerate(seeds, start=1):
+            if openai_key:
+                try:
+                    for q in fetch_openai_fanouts(seed, openai_key, openai_model):
+                        auto_rows.append({"query": q, "seed": seed,
+                                          "source": "chatgpt_observed"})
+                except requests.HTTPError as e:
+                    code = e.response.status_code if e.response is not None else "?"
+                    st.error(f"OpenAI error for '{seed}': {code} — "
+                             f"{e.response.text[:200] if e.response is not None else ''}")
+                except requests.RequestException as e:
+                    st.warning(f"OpenAI request failed for '{seed}': {e}")
+            if gemini_obs_key:
+                try:
+                    for q in fetch_gemini_grounding_fanouts(seed, gemini_obs_key,
+                                                            gemini_obs_model):
+                        auto_rows.append({"query": q, "seed": seed,
+                                          "source": "google_grounding_observed"})
+                except requests.HTTPError as e:
+                    code = e.response.status_code if e.response is not None else "?"
+                    st.error(f"Gemini error for '{seed}': {code} — "
+                             f"{e.response.text[:200] if e.response is not None else ''}")
+                except requests.RequestException as e:
+                    st.warning(f"Gemini request failed for '{seed}': {e}")
+            bar.progress(i / len(seeds),
+                         text=f"Automated — {i}/{len(seeds)} seeds · {len(auto_rows)} queries")
+        bar.empty()
+        if auto_rows:
+            df_new = pd.DataFrame(auto_rows).drop_duplicates(subset=["query"])
+            prev = st.session_state.get("df_observed", pd.DataFrame())
+            merged = (pd.concat([prev, df_new], ignore_index=True)
+                        .drop_duplicates(subset=["query"], keep="first"))
+            st.session_state["df_observed"] = merged
+            st.success(f"{len(df_new)} real fan-out queries extracted automatically.")
+        else:
+            st.warning("No queries returned. The docs note the search action "
+                       "*usually* (not always) includes queries — try seeds that "
+                       "clearly require fresh web data (prices, comparisons, news).")
+
+    st.markdown("##### Route 2 — DevTools console scripts (manual, free)")
 
     subtab_gam, subtab_gpt = st.tabs(["Google AI Mode", "ChatGPT"])
 
@@ -906,7 +1024,7 @@ with tab_observed:
         else:
             st.warning("Couldn't parse any queries from the pasted text.")
 
-    st.markdown("##### Route 2 — Saved page / HAR upload")
+    st.markdown("##### Route 3 — Saved page / HAR upload")
     st.caption(
         "Alternative: save the loaded AI Mode page (`Ctrl+S` → 'Webpage, HTML Only') "
         "or export a HAR (`F12` → *Network* → ⬇ export) from **either** google.com "
@@ -943,7 +1061,8 @@ with tab_observed:
         st.divider()
         c1, c2, c3 = st.columns(3)
         c1.metric("Observed queries", len(df))
-        c2.metric("Google AI Mode", int((df["source"] == "ai_mode_observed").sum()))
+        c2.metric("Google (AI Mode/grounding)", int(df["source"].isin(
+            ["ai_mode_observed", "google_grounding_observed"]).sum()))
         c3.metric("ChatGPT", int((df["source"] == "chatgpt_observed").sum()))
         st.dataframe(df, use_container_width=True, height=380)
         if st.button("🗑 Clear observed data"):
@@ -977,7 +1096,7 @@ with tab_results:
         c2.metric("Google Suggest", int((df_all["source"] == "google_suggest").sum()))
         c3.metric("Fan-outs (LLM)", int(df_all["source"].isin(["google_ai_mode", "chatgpt"]).sum()))
         c4.metric("Observed (real)", int(df_all["source"].isin(
-            ["ai_mode_observed", "chatgpt_observed"]).sum()))
+            ["ai_mode_observed", "chatgpt_observed", "google_grounding_observed"]).sum()))
 
         search = st.text_input("🔍 Search the consolidated list")
         view = df_all[df_all["query"].str.contains(search, case=False, na=False)] if search else df_all
