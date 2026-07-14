@@ -17,10 +17,6 @@ Two opportunity-mapping engines from a list of seed terms:
 Run locally:  streamlit run app.py
 """
 
-import hashlib
-import hmac
-import hashlib
-import hmac
 import json
 import random
 import re
@@ -52,71 +48,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ---------------------------------------------------------------------------
-# Authentication gate
-# ---------------------------------------------------------------------------
-# Credentials live in Streamlit secrets (never in code):
-#   [auth]                      <- .streamlit/secrets.toml locally, or the
-#   [auth.users]                   "Secrets" panel on Streamlit Community Cloud
-#   your_username = "<sha256 hash of the password>"
-# Generate a hash with:
-#   python -c "import hashlib,getpass;print(hashlib.sha256(getpass.getpass().encode()).hexdigest())"
-
-
-def _auth_users() -> dict:
-    try:
-        return dict(st.secrets["auth"]["users"])
-    except (KeyError, FileNotFoundError):
-        return {}
-
-
-def _verify(username: str, password: str, users: dict) -> bool:
-    stored = users.get(username.strip())
-    if not stored:
-        # burn the same time as a real check to avoid user enumeration
-        hmac.compare_digest("x" * 64, hashlib.sha256(b"x").hexdigest())
-        return False
-    supplied = hashlib.sha256(password.encode("utf-8")).hexdigest()
-    return hmac.compare_digest(supplied.lower(), str(stored).lower())
-
-
-def require_login():
-    if st.session_state.get("authenticated"):
-        return
-
-    users = _auth_users()
-    st.title("🔒 Query Opportunity Mapper")
-
-    if not users:
-        st.error(
-            "Authentication is not configured. Add authorized users to the app "
-            "secrets before using it:\n\n"
-            "```toml\n[auth.users]\nyour_username = \"<sha256 hash of the password>\"\n```\n"
-            "On Streamlit Community Cloud: app menu → **Settings** → **Secrets**. "
-            "Locally: `.streamlit/secrets.toml`. Generate the hash with:\n\n"
-            "```bash\npython -c \"import hashlib,getpass;"
-            "print(hashlib.sha256(getpass.getpass().encode()).hexdigest())\"\n```"
-        )
-        st.stop()
-
-    with st.form("login"):
-        st.subheader("Sign in")
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Sign in", type="primary",
-                                          use_container_width=True)
-    if submitted:
-        time.sleep(0.8)  # slow down brute-force attempts
-        if _verify(username, password, users):
-            st.session_state["authenticated"] = True
-            st.session_state["auth_user"] = username.strip()
-            st.rerun()
-        else:
-            st.error("Invalid username or password.")
-    st.stop()
-
-
-require_login()
 
 # ---------------------------------------------------------------------------
 # Constants — expansion modifiers (pt-BR and en)
@@ -275,12 +206,6 @@ def mine_google_suggest(seeds: list[str], hl: str, gl: str, lang: str,
 # Observed fan-outs — free capture from the real AI Mode interface
 # (DevTools console script + saved HTML / HAR parsing; no external APIs)
 # ---------------------------------------------------------------------------
-
-# matches google search links embedded in HTML/HAR/JSON payloads
-GOOGLE_SEARCH_LINK_RE = re.compile(
-    r"(?:https?:)?(?:\\/\\/|//)(?:www\.)?google\.[a-z.]{2,6}(?:\\/|/)search\?[^\"'\s<>\\]+"
-)
-
 
 def build_ai_mode_url(seed: str, hl: str, gl: str) -> str:
     """Build the Google AI Mode URL (udm=50) for a seed."""
@@ -452,17 +377,6 @@ CHATGPT_CONSOLE_SCRIPT = r"""(async () => {
 })();"""
 
 
-# patterns for ChatGPT search queries inside HAR/JSON captures
-CHATGPT_SQ_BLOCK_RE = re.compile(r'"search_queries"\s*:\s*\[(.{0,4000}?)\]', re.DOTALL)
-CHATGPT_Q_RE = re.compile(r'"q"\s*:\s*"((?:[^"\\]|\\.)*)"')
-CHATGPT_SEARCH_CALL_RE = re.compile(r'search\(\\?"((?:[^"\\)]|\\.)+?)\\?"\)')
-
-
-def _unescape_json_str(s: str) -> str:
-    s = s.replace('\\"', '"').replace("\\/", "/").replace("\\\\", "\\")
-    return re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), s)
-
-
 def parse_pasted_extraction(raw: str) -> list[dict]:
     """Parse JSON pasted back from the console script.
     Accepts one or more {seed, queries[]} objects, or plain one-per-line text."""
@@ -498,93 +412,31 @@ def parse_pasted_extraction(raw: str) -> list[dict]:
     return rows
 
 
-def _clean_embedded_url(raw: str) -> str:
-    """Normalize escaped URLs found inside HTML/JSON payloads."""
-    return (raw.replace("\\/", "/")
-               .replace("\\u0026", "&")
-               .replace("&amp;", "&")
-               .replace("\\u003d", "="))
-
-
-def _q_params_from_url(url: str) -> list[str]:
-    from urllib.parse import urlparse, parse_qs, unquote_plus
-    try:
-        qs = parse_qs(urlparse(url).query)
-        return [unquote_plus(q).strip() for q in qs.get("q", []) if q.strip()]
-    except ValueError:
-        return []
-
-
-def _walk_for_search_queries(obj, found: set):
-    """Recursively scan a JSON structure for embedded google search links."""
-    if isinstance(obj, dict):
-        for v in obj.values():
-            _walk_for_search_queries(v, found)
-    elif isinstance(obj, list):
-        for v in obj:
-            _walk_for_search_queries(v, found)
-    elif isinstance(obj, str) and "google." in obj and "/search" in obj:
-        for m in GOOGLE_SEARCH_LINK_RE.finditer(obj):
-            for q in _q_params_from_url(_clean_embedded_url(m.group(0))):
-                found.add(q)
-
-
-def _is_valid_query(q: str) -> bool:
-    return 0 < len(q) <= 120 and not q.startswith(("http", "site:"))
-
-
-def parse_capture_file(raw_bytes: bytes, filename: str) -> dict[str, str]:
-    """Extract search queries from a user-captured file (saved AI Mode HTML,
-    ChatGPT/AI Mode DevTools HAR export, or raw text).
-    Returns {query: source} where source is 'ai_mode_observed' or
-    'chatgpt_observed' depending on where the query was found."""
-    text = raw_bytes.decode("utf-8", errors="ignore")
-    found: dict[str, str] = {}
-
-    # --- Google AI Mode: embedded /search?q= links ---
-    google_qs: set = set()
-    for m in GOOGLE_SEARCH_LINK_RE.finditer(text):
-        for q in _q_params_from_url(_clean_embedded_url(m.group(0))):
-            google_qs.add(q)
-    if filename.lower().endswith(".har"):
-        try:
-            _walk_for_search_queries(json.loads(text), google_qs)
-        except json.JSONDecodeError:
-            pass
-    for q in google_qs:
-        if _is_valid_query(q):
-            found.setdefault(q, "ai_mode_observed")
-
-    # --- ChatGPT: search_queries blocks and search("...") tool calls ---
-    # HAR files embed the conversation JSON as an escaped string (\"...\"),
-    # so scan both the raw text and its unescaped variant.
-    chatgpt_qs: set = set()
-    for variant in (text, _unescape_json_str(text)):
-        for block in CHATGPT_SQ_BLOCK_RE.finditer(variant):
-            for qm in CHATGPT_Q_RE.finditer(block.group(1)):
-                chatgpt_qs.add(_unescape_json_str(qm.group(1)).strip())
-        for m in CHATGPT_SEARCH_CALL_RE.finditer(variant):
-            chatgpt_qs.add(_unescape_json_str(m.group(1)).strip())
-    for q in chatgpt_qs:
-        if _is_valid_query(q):
-            found.setdefault(q, "chatgpt_observed")
-
-    return found
-
-
 # ---------------------------------------------------------------------------
 # Query fan-out via LLM (Anthropic API or Google AI Studio / Gemini API)
 # ---------------------------------------------------------------------------
 PROVIDERS = {
-    "Anthropic (Claude)": {
-        "id": "anthropic",
+    "Anthropic Claude — simulated fan-outs": {
+        "id": "anthropic", "mode": "simulated",
         "fallback_models": ["claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
         "key_help": "Get your key at console.anthropic.com",
     },
-    "Google AI Studio (Gemini)": {
-        "id": "google",
+    "Google AI Studio (Gemini) — simulated fan-outs": {
+        "id": "google", "mode": "simulated",
         "fallback_models": ["gemini-flash-latest", "gemini-3.5-flash", "gemini-3.1-flash-lite"],
         "key_help": "Get your key at aistudio.google.com/apikey",
+    },
+    "OpenAI (ChatGPT) — real extracted fan-outs": {
+        "id": "openai", "mode": "observed",
+        "fallback_models": ["gpt-5-mini", "gpt-5", "gpt-4.1-mini"],
+        "key_help": "Get your key at platform.openai.com/api-keys — the web_search "
+                    "tool returns the searches the model actually executed",
+    },
+    "Google Search grounding (Gemini) — real extracted fan-outs": {
+        "id": "google_grounding", "mode": "observed",
+        "fallback_models": ["gemini-flash-latest", "gemini-3.5-flash", "gemini-3.1-flash-lite"],
+        "key_help": "Uses your Google AI Studio key — grounding returns the real "
+                    "webSearchQueries Google executed (free tier works)",
     },
 }
 
@@ -597,7 +449,20 @@ _NON_CHAT_FRAGMENTS = ("embedding", "tts", "image", "veo", "imagen",
 def list_available_models(provider_id: str, api_key: str) -> list[str]:
     """Fetch the models actually available to this API key.
     Raises on failure — caller decides the fallback."""
-    if provider_id == "google":
+    if provider_id == "openai":
+        r = requests.get(
+            "https://api.openai.com/v1/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=15,
+        )
+        r.raise_for_status()
+        models = [m["id"] for m in r.json().get("data", [])
+                  if m.get("id", "").startswith("gpt-")
+                  and not any(frag in m["id"] for frag in _NON_CHAT_FRAGMENTS)]
+        models.sort(key=lambda n: ("mini" not in n, n))
+        return models
+
+    if provider_id in ("google", "google_grounding"):
         r = requests.get(
             "https://generativelanguage.googleapis.com/v1beta/models",
             headers={"x-goog-api-key": api_key},
@@ -747,16 +612,35 @@ def call_with_retry(call_fn, prompt: str, api_key: str, model: str,
     raise last_err  # pragma: no cover
 
 
-def generate_fanouts(seeds: list[str], provider_id: str, api_key: str, lang: str,
+def generate_fanouts(seeds: list[str], provider: dict, api_key: str, lang: str,
                      n_per_type: int, business_context: str,
                      model: str, progress_cb=None) -> pd.DataFrame:
-    """Generate fan-outs for each seed using the selected LLM provider."""
+    """Generate fan-outs for each seed with the selected provider.
+    Simulated providers (Claude/Gemini) prompt the model to replicate fan-out
+    behavior; observed providers (OpenAI web_search / Gemini grounding) return
+    the real search queries the system executed."""
     rows = []
+    provider_id, mode = provider["id"], provider.get("mode", "simulated")
     call_fn = call_anthropic if provider_id == "anthropic" else call_gemini
     status_box = st.empty()
 
     for i, seed in enumerate(seeds, start=1):
         try:
+            if mode == "observed":
+                if provider_id == "openai":
+                    queries = fetch_openai_fanouts(seed, api_key, model)
+                    src_label = "chatgpt_observed"
+                else:
+                    queries = fetch_gemini_grounding_fanouts(seed, api_key, model)
+                    src_label = "google_grounding_observed"
+                for q in queries:
+                    rows.append({"query": q, "seed": seed, "source": src_label,
+                                 "fanout_type": "observed_search", "intent": ""})
+                if progress_cb:
+                    progress_cb(i / len(seeds),
+                                f"Fan-outs — {i}/{len(seeds)} seeds · {len(rows)} queries")
+                continue
+
             text = call_with_retry(
                 call_fn,
                 build_fanout_prompt(seed, lang, n_per_type, business_context),
@@ -812,12 +696,6 @@ def to_xlsx(dfs: dict[str, pd.DataFrame]) -> bytes:
 # UI — Sidebar
 # ---------------------------------------------------------------------------
 st.sidebar.title("⚙️ Settings")
-st.sidebar.caption(f"Signed in as **{st.session_state.get('auth_user', '')}**")
-if st.sidebar.button("Sign out", use_container_width=True):
-    for k in ("authenticated", "auth_user"):
-        st.session_state.pop(k, None)
-    st.rerun()
-st.sidebar.divider()
 
 lang = st.sidebar.selectbox("Expansion language", ["pt-BR", "en"], index=0)
 hl = st.sidebar.text_input("hl (Google interface language)", value="pt-BR" if lang == "pt-BR" else "en")
@@ -866,12 +744,17 @@ model = st.sidebar.selectbox(
          if models_are_live else
          "Default list — enter a valid API key to load the models available to your account.",
 )
-n_per_type = st.sidebar.slider("Fan-outs per type", 3, 15, 8)
-business_context = st.sidebar.text_area(
-    "Business context (optional)",
-    placeholder="E.g.: home appliances e-commerce in Brazil, focused on white goods...",
-    height=80,
-)
+if provider.get("mode") == "simulated":
+    n_per_type = st.sidebar.slider("Fan-outs per type", 3, 15, 8)
+    business_context = st.sidebar.text_area(
+        "Business context (optional)",
+        placeholder="E.g.: home appliances e-commerce in Brazil, focused on white goods...",
+        height=80,
+    )
+else:
+    n_per_type, business_context = 0, ""
+    st.sidebar.caption("Real extraction mode: the provider returns the searches "
+                       "it actually executed — no simulation settings needed.")
 
 # ---------------------------------------------------------------------------
 # UI — Main body
@@ -931,15 +814,19 @@ with tab_suggest:
 # ---- Tab 2: Fan-outs ----
 with tab_fanout:
     st.markdown(
-        "Generates synthetic fan-outs replicating **Google AI Mode** decomposition "
+        "Two modes, selected via the **LLM provider** in the sidebar. "
+        "**Simulated** (Claude / Gemini): replicates Google AI Mode decomposition "
         "(reformulations, related, implicit, comparative, entity expansion) and "
-        "**ChatGPT conversational follow-ups**, classified by type and search intent."
+        "ChatGPT follow-ups, classified by type and intent. "
+        "**Real extracted** (OpenAI / Gemini grounding): runs each seed through the "
+        "provider's live web search and returns the queries the system *actually* "
+        "executed (`web_search_call.action` / `webSearchQueries`) — zero simulation."
     )
     if st.button("▶️ Generate Fan-outs", type="primary", disabled=not (seeds and api_key)):
         bar = st.progress(0.0, text="Starting...")
         cb = lambda p, msg: bar.progress(min(p, 1.0), text=msg)
         with st.spinner("Generating fan-outs via LLM..."):
-            df_fan = generate_fanouts(seeds, provider["id"], api_key, lang,
+            df_fan = generate_fanouts(seeds, provider, api_key, lang,
                                       n_per_type, business_context, model,
                                       progress_cb=cb)
         bar.empty()
@@ -955,8 +842,9 @@ with tab_fanout:
         df = st.session_state["df_fanout"]
         c1, c2, c3 = st.columns(3)
         c1.metric("Unique fan-outs", len(df))
-        c2.metric("Google AI Mode", int((df["source"] == "google_ai_mode").sum()))
-        c3.metric("ChatGPT (follow-ups)", int((df["source"] == "chatgpt").sum()))
+        c2.metric("Simulated", int(df["source"].isin(["google_ai_mode", "chatgpt"]).sum()))
+        c3.metric("Real extracted", int(df["source"].isin(
+            ["chatgpt_observed", "google_grounding_observed"]).sum()))
         f1, f2 = st.columns(2)
         type_sel = f1.multiselect("Filter by type", sorted(df["fanout_type"].unique()))
         int_sel = f2.multiselect("Filter by intent", sorted(df["intent"].unique()))
@@ -970,75 +858,12 @@ with tab_fanout:
 # ---- Tab 3: Observed fan-outs (free capture from the real interface) ----
 with tab_observed:
     st.markdown(
-        "Captures **real fan-out queries** executed by search-powered AI systems — "
-        "no LLM simulation. Three routes, from fully automated to fully manual."
+        "Manual capture of the **real fan-out queries exposed by the consumer "
+        "interfaces** (Google AI Mode and chatgpt.com) — useful to validate what the "
+        "actual products execute, complementing the automated extraction available "
+        "in the Fan-out Generator. Follow the steps, run the script in your own "
+        "browser, and paste the JSON back here."
     )
-
-    st.markdown("##### Route 1 — Fully automated (official APIs) ⚡")
-    st.markdown(
-        "Seed in → real executed queries out, zero browser steps. The **OpenAI "
-        "Responses API** (`web_search` tool) returns every search the model actually "
-        "ran (`web_search_call.action`), same search stack as ChatGPT. The **Gemini "
-        "API** with Google Search grounding returns `webSearchQueries` — the real "
-        "queries Google executed (free tier works). Direct automation of chatgpt.com "
-        "itself isn't offered: it requires your logged-in session and violates "
-        "OpenAI's terms — the API is the official equivalent."
-    )
-    a1, a2 = st.columns(2)
-    openai_key = a1.text_input("OpenAI API Key (ChatGPT fan-outs)", type="password",
-                               help="platform.openai.com/api-keys — web_search tool "
-                                    "calls cost a few cents per seed.")
-    openai_model = a1.text_input("OpenAI model", value="gpt-5-mini",
-                                 help="Any model supporting the web_search tool.")
-    gemini_obs_key = a2.text_input("Google AI Studio Key (Google fan-outs)", type="password",
-                                   help="aistudio.google.com/apikey — same key used "
-                                        "for fan-out generation works.")
-    gemini_obs_model = a2.text_input("Gemini model", value="gemini-flash-latest")
-
-    if st.button("▶️ Run Automated Extraction", type="primary",
-                 disabled=not (seeds and (openai_key or gemini_obs_key))):
-        bar = st.progress(0.0, text="Starting...")
-        auto_rows = []
-        for i, seed in enumerate(seeds, start=1):
-            if openai_key:
-                try:
-                    for q in fetch_openai_fanouts(seed, openai_key, openai_model):
-                        auto_rows.append({"query": q, "seed": seed,
-                                          "source": "chatgpt_observed"})
-                except requests.HTTPError as e:
-                    code = e.response.status_code if e.response is not None else "?"
-                    st.error(f"OpenAI error for '{seed}': {code} — "
-                             f"{e.response.text[:200] if e.response is not None else ''}")
-                except requests.RequestException as e:
-                    st.warning(f"OpenAI request failed for '{seed}': {e}")
-            if gemini_obs_key:
-                try:
-                    for q in fetch_gemini_grounding_fanouts(seed, gemini_obs_key,
-                                                            gemini_obs_model):
-                        auto_rows.append({"query": q, "seed": seed,
-                                          "source": "google_grounding_observed"})
-                except requests.HTTPError as e:
-                    code = e.response.status_code if e.response is not None else "?"
-                    st.error(f"Gemini error for '{seed}': {code} — "
-                             f"{e.response.text[:200] if e.response is not None else ''}")
-                except requests.RequestException as e:
-                    st.warning(f"Gemini request failed for '{seed}': {e}")
-            bar.progress(i / len(seeds),
-                         text=f"Automated — {i}/{len(seeds)} seeds · {len(auto_rows)} queries")
-        bar.empty()
-        if auto_rows:
-            df_new = pd.DataFrame(auto_rows).drop_duplicates(subset=["query"])
-            prev = st.session_state.get("df_observed", pd.DataFrame())
-            merged = (pd.concat([prev, df_new], ignore_index=True)
-                        .drop_duplicates(subset=["query"], keep="first"))
-            st.session_state["df_observed"] = merged
-            st.success(f"{len(df_new)} real fan-out queries extracted automatically.")
-        else:
-            st.warning("No queries returned. The docs note the search action "
-                       "*usually* (not always) includes queries — try seeds that "
-                       "clearly require fresh web data (prices, comparisons, news).")
-
-    st.markdown("##### Route 2 — DevTools console scripts (manual, free)")
 
     subtab_gam, subtab_gpt = st.tabs(["Google AI Mode", "ChatGPT"])
 
@@ -1099,38 +924,6 @@ with tab_observed:
             st.success(f"{len(df_new)} queries parsed and added.")
         else:
             st.warning("Couldn't parse any queries from the pasted text.")
-
-    st.markdown("##### Route 3 — Saved page / HAR upload")
-    st.caption(
-        "Alternative: save the loaded AI Mode page (`Ctrl+S` → 'Webpage, HTML Only') "
-        "or export a HAR (`F12` → *Network* → ⬇ export) from **either** google.com "
-        "AI Mode **or** chatgpt.com while the answer streams. Upload the files and "
-        "the app extracts every embedded sub-query, auto-detecting the platform — "
-        "same data, no console needed."
-    )
-    uploads = st.file_uploader(
-        "Upload captures (.html, .har, .txt)",
-        type=["html", "har", "txt", "mhtml"],
-        accept_multiple_files=True,
-    )
-    if uploads:
-        manual_rows = []
-        for up in uploads:
-            queries = parse_capture_file(up.getvalue(), up.name)
-            for q, src in queries.items():
-                manual_rows.append({
-                    "query": q,
-                    "seed": f"capture: {up.name}",
-                    "source": src,
-                })
-            st.caption(f"`{up.name}` → {len(queries)} queries extracted")
-        if manual_rows:
-            df_man = pd.DataFrame(manual_rows).drop_duplicates(subset=["query"])
-            prev = st.session_state.get("df_observed", pd.DataFrame())
-            merged = (pd.concat([prev, df_man], ignore_index=True)
-                        .drop_duplicates(subset=["query"], keep="first"))
-            st.session_state["df_observed"] = merged
-            st.success(f"{len(df_man)} queries added from uploaded captures.")
 
     if "df_observed" in st.session_state and not st.session_state["df_observed"].empty:
         df = st.session_state["df_observed"]
