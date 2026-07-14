@@ -249,7 +249,7 @@ def fetch_openai_fanouts(seed: str, api_key: str, model: str,
     web_search tool and return the actual search queries the model executed
     (web_search_call -> action.query / action.queries). Query language is
     forced via prompt; search localization via the tool's user_location."""
-    lang_name = "Brazilian Portuguese" if lang == "pt-BR" else "English"
+    lang_name = _lang_name(lang)
     web_tool = {"type": "web_search"}
     if country and len(country.strip()) == 2:
         web_tool["user_location"] = {"type": "approximate",
@@ -295,7 +295,7 @@ def fetch_gemini_grounding_fanouts(seed: str, api_key: str, model: str,
     """Fully automated: run the seed through the Gemini API with Google Search
     grounding and return the actual queries Google executed
     (groundingMetadata.webSearchQueries). Query language forced via prompt."""
-    lang_name = "Brazilian Portuguese" if lang == "pt-BR" else "English"
+    lang_name = _lang_name(lang)
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     r = requests.post(
         url,
@@ -440,6 +440,23 @@ def parse_pasted_extraction(raw: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 # Query fan-out via LLM (Anthropic API or Google AI Studio / Gemini API)
 # ---------------------------------------------------------------------------
+# languages available for fan-out generation/extraction (independent from the
+# Google Suggest expansion language, which needs dedicated modifier sets)
+FANOUT_LANGUAGES = {
+    "pt-BR": "Brazilian Portuguese",
+    "en": "English",
+    "es": "Spanish",
+    "es-MX": "Mexican Spanish",
+    "fr": "French",
+    "de": "German",
+    "it": "Italian",
+}
+
+
+def _lang_name(lang: str) -> str:
+    return FANOUT_LANGUAGES.get(lang, "English")
+
+
 PROVIDERS = {
     "Anthropic Claude — simulated fan-outs": {
         "id": "anthropic", "mode": "simulated",
@@ -530,7 +547,7 @@ Respond ONLY with valid JSON — no markdown, no backticks, no extra text."""
 
 def build_fanout_prompt(seed: str, lang: str, n_per_type: int,
                         business_context: str) -> str:
-    lang_name = "Brazilian Portuguese" if lang == "pt-BR" else "English"
+    lang_name = _lang_name(lang)
     ctx = f"\nBusiness context (use it to make fan-outs specific): {business_context}" if business_context else ""
     return f"""Original query: "{seed}"{ctx}
 
@@ -744,6 +761,15 @@ delay = st.sidebar.slider("Delay between requests (seconds)", 0.1, 2.0, (0.2, 0.
 
 st.sidebar.divider()
 st.sidebar.subheader("Query Fan-out (LLM)")
+_fanout_lang_keys = list(FANOUT_LANGUAGES.keys())
+fanout_lang = st.sidebar.selectbox(
+    "Fan-out language",
+    _fanout_lang_keys,
+    index=_fanout_lang_keys.index(lang) if lang in _fanout_lang_keys else 0,
+    format_func=lambda k: f"{FANOUT_LANGUAGES[k]} ({k})",
+    help="Language of the generated/extracted fan-out queries. Independent from "
+         "the Suggest expansion language above.",
+)
 provider_name = st.sidebar.selectbox("LLM provider", list(PROVIDERS.keys()), index=0)
 provider = PROVIDERS[provider_name]
 api_key = st.sidebar.text_input(f"{provider_name} API Key", type="password",
@@ -857,7 +883,7 @@ with tab_fanout:
         bar = st.progress(0.0, text="Starting...")
         cb = lambda p, msg: bar.progress(min(p, 1.0), text=msg)
         with st.spinner("Generating fan-outs via LLM..."):
-            df_fan = generate_fanouts(seeds, provider, api_key, lang,
+            df_fan = generate_fanouts(seeds, provider, api_key, fanout_lang,
                                       n_per_type, business_context, model,
                                       country=gl, progress_cb=cb)
         bar.empty()
