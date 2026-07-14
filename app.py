@@ -243,10 +243,17 @@ CONSOLE_SCRIPT = r"""(() => {
 })();"""
 
 
-def fetch_openai_fanouts(seed: str, api_key: str, model: str) -> list[str]:
+def fetch_openai_fanouts(seed: str, api_key: str, model: str,
+                         lang: str = "pt-BR", country: str = "br") -> list[str]:
     """Fully automated: run the seed through the OpenAI Responses API with the
     web_search tool and return the actual search queries the model executed
-    (web_search_call -> action.query / action.queries)."""
+    (web_search_call -> action.query / action.queries). Query language is
+    forced via prompt; search localization via the tool's user_location."""
+    lang_name = "Brazilian Portuguese" if lang == "pt-BR" else "English"
+    web_tool = {"type": "web_search"}
+    if country and len(country.strip()) == 2:
+        web_tool["user_location"] = {"type": "approximate",
+                                     "country": country.strip().upper()}
     r = requests.post(
         "https://api.openai.com/v1/responses",
         headers={"Authorization": f"Bearer {api_key}",
@@ -260,10 +267,11 @@ def fetch_openai_fanouts(seed: str, api_key: str, model: str) -> list[str]:
                 "with a DIFFERENT query: cover subtopics, comparisons vs alternatives, "
                 "buying criteria, prices/reviews when relevant, and related questions "
                 "people ask. Never repeat the topic verbatim as your only search. "
-                "Keep the queries in the same language as the topic. After searching, "
-                "reply with a single short sentence."
+                f"Write ALL search queries in {lang_name}, regardless of the "
+                "language of this instruction. After searching, reply with a single "
+                "short sentence."
             ),
-            "tools": [{"type": "web_search"}],
+            "tools": [web_tool],
             "tool_choice": "auto",
         },
         timeout=180,
@@ -282,10 +290,12 @@ def fetch_openai_fanouts(seed: str, api_key: str, model: str) -> list[str]:
     return list(dict.fromkeys(queries))  # dedupe preserving order
 
 
-def fetch_gemini_grounding_fanouts(seed: str, api_key: str, model: str) -> list[str]:
+def fetch_gemini_grounding_fanouts(seed: str, api_key: str, model: str,
+                                   lang: str = "pt-BR") -> list[str]:
     """Fully automated: run the seed through the Gemini API with Google Search
     grounding and return the actual queries Google executed
-    (groundingMetadata.webSearchQueries)."""
+    (groundingMetadata.webSearchQueries). Query language forced via prompt."""
+    lang_name = "Brazilian Portuguese" if lang == "pt-BR" else "English"
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     r = requests.post(
         url,
@@ -297,8 +307,9 @@ def fetch_gemini_grounding_fanouts(seed: str, api_key: str, model: str) -> list[
                 "Use Google Search to run MULTIPLE DISTINCT searches (at least 6), "
                 "each with a DIFFERENT query: cover subtopics, comparisons vs "
                 "alternatives, buying criteria, prices/reviews when relevant, and "
-                "related questions people ask. Keep the queries in the same language "
-                "as the topic. Then reply with a single short sentence."
+                f"related questions people ask. Write ALL search queries in "
+                f"{lang_name}, regardless of the language of this instruction. "
+                "Then reply with a single short sentence."
             )}]}],
             "tools": [{"google_search": {}}],
         },
@@ -628,7 +639,8 @@ def call_with_retry(call_fn, prompt: str, api_key: str, model: str,
 
 def generate_fanouts(seeds: list[str], provider: dict, api_key: str, lang: str,
                      n_per_type: int, business_context: str,
-                     model: str, progress_cb=None) -> pd.DataFrame:
+                     model: str, country: str = "br",
+                     progress_cb=None) -> pd.DataFrame:
     """Generate fan-outs for each seed with the selected provider.
     Simulated providers (Claude/Gemini) prompt the model to replicate fan-out
     behavior; observed providers (OpenAI web_search / Gemini grounding) return
@@ -642,10 +654,12 @@ def generate_fanouts(seeds: list[str], provider: dict, api_key: str, lang: str,
         try:
             if mode == "observed":
                 if provider_id == "openai":
-                    queries = fetch_openai_fanouts(seed, api_key, model)
+                    queries = fetch_openai_fanouts(seed, api_key, model,
+                                                   lang=lang, country=country)
                     src_label = "chatgpt_observed"
                 else:
-                    queries = fetch_gemini_grounding_fanouts(seed, api_key, model)
+                    queries = fetch_gemini_grounding_fanouts(seed, api_key, model,
+                                                             lang=lang)
                     src_label = "google_grounding_observed"
                 for q in queries:
                     rows.append({"query": q, "seed": seed, "source": src_label,
@@ -845,7 +859,7 @@ with tab_fanout:
         with st.spinner("Generating fan-outs via LLM..."):
             df_fan = generate_fanouts(seeds, provider, api_key, lang,
                                       n_per_type, business_context, model,
-                                      progress_cb=cb)
+                                      country=gl, progress_cb=cb)
         bar.empty()
         st.session_state["df_fanout"] = df_fan
         if not df_fan.empty:
