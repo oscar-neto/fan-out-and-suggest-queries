@@ -280,8 +280,16 @@ CHATGPT_CONSOLE_SCRIPT = r"""(async () => {
       typeof users[0].content.parts[0] === 'string')
     seed = users[0].content.parts[0].trim().slice(0, 80);
   const out = [...qs].filter(q => q && q.length <= 120);
-  copy(JSON.stringify({ seed: seed, platform: 'chatgpt', queries: out }));
-  console.log(out.length + ' queries copied to clipboard - paste them back into the app.');
+  const payload = JSON.stringify({ seed: seed, platform: 'chatgpt', queries: out });
+  window.__fanout = payload;  // kept for manual copy fallback
+  try {
+    await navigator.clipboard.writeText(payload);
+    console.log(out.length + ' queries copied to clipboard - paste them back into the app.');
+  } catch (e) {
+    // clipboard API may be blocked while DevTools has focus
+    console.log(payload);
+    console.log(out.length + ' queries extracted. Clipboard was blocked - either copy the JSON above, or run this one-liner now:  copy(window.__fanout)');
+  }
 })();"""
 
 
