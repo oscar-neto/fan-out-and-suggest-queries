@@ -253,8 +253,16 @@ def fetch_openai_fanouts(seed: str, api_key: str, model: str) -> list[str]:
                  "Content-Type": "application/json"},
         json={
             "model": model,
-            "input": ("Research this topic thoroughly using web search, covering "
-                      f"multiple angles, subtopics and comparisons: {seed}"),
+            "input": (
+                "You are researching to build a comprehensive answer about this "
+                f"topic: {seed}\n\n"
+                "Use the web search tool to run AT LEAST 6 DISTINCT searches, each "
+                "with a DIFFERENT query: cover subtopics, comparisons vs alternatives, "
+                "buying criteria, prices/reviews when relevant, and related questions "
+                "people ask. Never repeat the topic verbatim as your only search. "
+                "Keep the queries in the same language as the topic. After searching, "
+                "reply with a single short sentence."
+            ),
             "tools": [{"type": "web_search"}],
             "tool_choice": "auto",
         },
@@ -271,7 +279,7 @@ def fetch_openai_fanouts(seed: str, api_key: str, model: str) -> list[str]:
             for q in action.get("queries") or []:
                 if isinstance(q, str) and q.strip():
                     queries.append(q.strip())
-    return queries
+    return list(dict.fromkeys(queries))  # dedupe preserving order
 
 
 def fetch_gemini_grounding_fanouts(seed: str, api_key: str, model: str) -> list[str]:
@@ -283,9 +291,15 @@ def fetch_gemini_grounding_fanouts(seed: str, api_key: str, model: str) -> list[
         url,
         headers={"x-goog-api-key": api_key, "content-type": "application/json"},
         json={
-            "contents": [{"parts": [{"text":
-                ("Research this topic thoroughly using Google Search, covering "
-                 f"multiple angles, subtopics and comparisons: {seed}")}]}],
+            "contents": [{"parts": [{"text": (
+                "You are researching to build a comprehensive answer about this "
+                f"topic: {seed}\n\n"
+                "Use Google Search to run MULTIPLE DISTINCT searches (at least 6), "
+                "each with a DIFFERENT query: cover subtopics, comparisons vs "
+                "alternatives, buying criteria, prices/reviews when relevant, and "
+                "related questions people ask. Keep the queries in the same language "
+                "as the topic. Then reply with a single short sentence."
+            )}]}],
             "tools": [{"google_search": {}}],
         },
         timeout=180,
@@ -297,7 +311,7 @@ def fetch_gemini_grounding_fanouts(seed: str, api_key: str, model: str) -> list[
         for q in gm.get("webSearchQueries") or []:
             if isinstance(q, str) and q.strip():
                 queries.append(q.strip())
-    return queries
+    return list(dict.fromkeys(queries))  # dedupe preserving order
 
 
 CHATGPT_CONSOLE_SCRIPT = r"""(async () => {
@@ -727,7 +741,10 @@ if api_key:
     try:
         live_models = list_available_models(provider["id"], api_key)
         if live_models:
-            model_options = live_models
+            # recommended models first (they drive the best fan-out behavior),
+            # then the rest of what the key can access
+            preferred = [m for m in provider["fallback_models"] if m in live_models]
+            model_options = preferred + [m for m in live_models if m not in preferred]
             models_are_live = True
     except requests.HTTPError as e:
         code = e.response.status_code if e.response is not None else "?"
