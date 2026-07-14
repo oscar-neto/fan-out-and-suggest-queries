@@ -248,6 +248,54 @@ CONSOLE_SCRIPT = r"""(() => {
 })();"""
 
 
+CHATGPT_CONSOLE_SCRIPT = r"""(async () => {
+  const id = (location.pathname.split('/c/')[1] || '').split('/')[0];
+  if (!id) { console.log('Open a ChatGPT conversation first (URL must contain /c/...).'); return; }
+  const s = await fetch('/api/auth/session').then(r => r.json());
+  if (!s || !s.accessToken) { console.log('Could not read session token - are you logged in?'); return; }
+  const conv = await fetch('/backend-api/conversation/' + id, {
+    headers: { authorization: 'Bearer ' + s.accessToken }
+  }).then(r => r.json());
+  const qs = new Set();
+  const walk = (o) => {
+    if (!o || typeof o !== 'object') return;
+    if (Array.isArray(o)) { o.forEach(walk); return; }
+    if (Array.isArray(o.search_queries))
+      o.search_queries.forEach(e => { if (e && e.q) qs.add(String(e.q).trim()); });
+    if (typeof o.search_query === 'string') qs.add(o.search_query.trim());
+    Object.values(o).forEach(walk);
+  };
+  walk(conv);
+  // also catch search("...") tool invocations serialized in message parts
+  const raw = JSON.stringify(conv);
+  const re = /search\(\\"((?:[^"\\]|\\.)+?)\\"\)/g;
+  let m; while ((m = re.exec(raw))) qs.add(m[1].replace(/\\"/g, '"').trim());
+  // seed = first user message (chronological)
+  const users = Object.values(conv.mapping || {})
+    .map(n => n && n.message).filter(msg =>
+      msg && msg.author && msg.author.role === 'user' && msg.create_time)
+    .sort((a, b) => a.create_time - b.create_time);
+  let seed = 'chatgpt';
+  if (users.length && users[0].content && users[0].content.parts &&
+      typeof users[0].content.parts[0] === 'string')
+    seed = users[0].content.parts[0].trim().slice(0, 80);
+  const out = [...qs].filter(q => q && q.length <= 120);
+  copy(JSON.stringify({ seed: seed, platform: 'chatgpt', queries: out }));
+  console.log(out.length + ' queries copied to clipboard - paste them back into the app.');
+})();"""
+
+
+# patterns for ChatGPT search queries inside HAR/JSON captures
+CHATGPT_SQ_BLOCK_RE = re.compile(r'"search_queries"\s*:\s*\[(.{0,4000}?)\]', re.DOTALL)
+CHATGPT_Q_RE = re.compile(r'"q"\s*:\s*"((?:[^"\\]|\\.)*)"')
+CHATGPT_SEARCH_CALL_RE = re.compile(r'search\(\\?"((?:[^"\\)]|\\.)+?)\\?"\)')
+
+
+def _unescape_json_str(s: str) -> str:
+    s = s.replace('\\"', '"').replace("\\/", "/").replace("\\\\", "\\")
+    return re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), s)
+
+
 def parse_pasted_extraction(raw: str) -> list[dict]:
     """Parse JSON pasted back from the console script.
     Accepts one or more {seed, queries[]} objects, or plain one-per-line text."""
@@ -268,10 +316,12 @@ def parse_pasted_extraction(raw: str) -> list[dict]:
         idx = end
         if isinstance(obj, dict):
             seed = str(obj.get("seed", "")).strip() or "console_extraction"
+            platform = str(obj.get("platform", "")).strip().lower()
+            source = "chatgpt_observed" if platform == "chatgpt" else "ai_mode_observed"
             for q in obj.get("queries", []):
                 if isinstance(q, str) and q.strip():
                     rows.append({"query": q.strip(), "seed": seed,
-                                 "source": "ai_mode_observed"})
+                                 "source": source})
     if not parsed_any:  # fallback: plain lines
         for line in raw.splitlines():
             line = line.strip().strip('",')
@@ -312,22 +362,47 @@ def _walk_for_search_queries(obj, found: set):
                 found.add(q)
 
 
-def parse_capture_file(raw_bytes: bytes, filename: str) -> set[str]:
-    """Extract google search queries from a user-captured file
-    (saved AI Mode/SERP HTML, DevTools HAR export, or raw text)."""
+def _is_valid_query(q: str) -> bool:
+    return 0 < len(q) <= 120 and not q.startswith(("http", "site:"))
+
+
+def parse_capture_file(raw_bytes: bytes, filename: str) -> dict[str, str]:
+    """Extract search queries from a user-captured file (saved AI Mode HTML,
+    ChatGPT/AI Mode DevTools HAR export, or raw text).
+    Returns {query: source} where source is 'ai_mode_observed' or
+    'chatgpt_observed' depending on where the query was found."""
     text = raw_bytes.decode("utf-8", errors="ignore")
-    found: set = set()
+    found: dict[str, str] = {}
+
+    # --- Google AI Mode: embedded /search?q= links ---
+    google_qs: set = set()
     for m in GOOGLE_SEARCH_LINK_RE.finditer(text):
         for q in _q_params_from_url(_clean_embedded_url(m.group(0))):
-            found.add(q)
-    # HAR files: also walk the JSON structure (URLs may be split across fields)
+            google_qs.add(q)
     if filename.lower().endswith(".har"):
         try:
-            _walk_for_search_queries(json.loads(text), found)
+            _walk_for_search_queries(json.loads(text), google_qs)
         except json.JSONDecodeError:
             pass
-    # drop obvious noise (navigation params, empty, very long payload strings)
-    return {q for q in found if 0 < len(q) <= 120 and not q.startswith(("http", "site:"))}
+    for q in google_qs:
+        if _is_valid_query(q):
+            found.setdefault(q, "ai_mode_observed")
+
+    # --- ChatGPT: search_queries blocks and search("...") tool calls ---
+    # HAR files embed the conversation JSON as an escaped string (\"...\"),
+    # so scan both the raw text and its unescaped variant.
+    chatgpt_qs: set = set()
+    for variant in (text, _unescape_json_str(text)):
+        for block in CHATGPT_SQ_BLOCK_RE.finditer(variant):
+            for qm in CHATGPT_Q_RE.finditer(block.group(1)):
+                chatgpt_qs.add(_unescape_json_str(qm.group(1)).strip())
+        for m in CHATGPT_SEARCH_CALL_RE.finditer(variant):
+            chatgpt_qs.add(_unescape_json_str(m.group(1)).strip())
+    for q in chatgpt_qs:
+        if _is_valid_query(q):
+            found.setdefault(q, "chatgpt_observed")
+
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -729,27 +804,50 @@ with tab_observed:
         "own browsing session:"
     )
 
-    st.markdown("##### Route 1 — DevTools console script (recommended)")
-    st.markdown(
-        "**Step 1.** Open the AI Mode link for each seed below and wait for the "
-        "answer to fully load (expand sections if shown):"
-    )
-    if seeds:
-        for seed in seeds:
-            st.markdown(f"- [{seed}]({build_ai_mode_url(seed, hl, gl)})")
-    else:
-        st.caption("Add seeds above to generate the AI Mode links.")
+    st.markdown("##### Route 1 — DevTools console scripts (recommended)")
 
-    st.markdown(
-        "**Step 2.** Press `F12` → *Console* tab, paste the script below and hit "
-        "Enter. It scans the rendered answer and the streamed payload for embedded "
-        "search queries and copies them to your clipboard as JSON. "
-        "(If the console blocks pasting, type `allow pasting` first — that's a "
-        "Chrome safety prompt.)"
-    )
-    st.code(CONSOLE_SCRIPT, language="javascript")
+    subtab_gam, subtab_gpt = st.tabs(["Google AI Mode", "ChatGPT"])
 
-    st.markdown("**Step 3.** Paste the JSON here (repeat per seed — paste one after the other):")
+    with subtab_gam:
+        st.markdown(
+            "**Step 1.** Open the AI Mode link for each seed below and wait for the "
+            "answer to fully load (expand sections if shown):"
+        )
+        if seeds:
+            for seed in seeds:
+                st.markdown(f"- [{seed}]({build_ai_mode_url(seed, hl, gl)})")
+        else:
+            st.caption("Add seeds above to generate the AI Mode links.")
+
+        st.markdown(
+            "**Step 2.** Press `F12` → *Console* tab, paste the script below and hit "
+            "Enter. It scans the rendered answer and the streamed payload for embedded "
+            "search queries and copies them to your clipboard as JSON. "
+            "(If the console blocks pasting, type `allow pasting` first — that's a "
+            "Chrome safety prompt.)"
+        )
+        st.code(CONSOLE_SCRIPT, language="javascript")
+
+    with subtab_gpt:
+        st.markdown(
+            "**Step 1.** On [chatgpt.com](https://chatgpt.com), ask each seed as a "
+            "prompt (enable *Search the web* if it doesn't trigger automatically) "
+            "and wait for the full answer. The executed sub-searches live in the "
+            "conversation JSON, not in the visible page."
+        )
+        if seeds:
+            st.caption("Suggested prompts (one conversation per seed): " +
+                       " · ".join(f"`{s}`" for s in seeds))
+        st.markdown(
+            "**Step 2.** With the conversation open (URL containing `/c/...`), press "
+            "`F12` → *Console*, paste the script below and hit Enter. It fetches the "
+            "conversation JSON from your own logged-in session, walks it for every "
+            "`search_queries` entry and `search(\"...\")` tool call, and copies the "
+            "result to your clipboard as JSON."
+        )
+        st.code(CHATGPT_CONSOLE_SCRIPT, language="javascript")
+
+    st.markdown("**Step 3.** Paste the JSON here (repeat per seed/conversation — paste one after the other):")
     pasted = st.text_area(
         "Extraction output",
         placeholder='{"seed": "air fryer", "queries": ["air fryer vs oven", ...]}',
@@ -770,10 +868,11 @@ with tab_observed:
 
     st.markdown("##### Route 2 — Saved page / HAR upload")
     st.caption(
-        "Alternative: on the loaded AI Mode page, save it (`Ctrl+S` → 'Webpage, "
-        "HTML Only') or export a HAR (`F12` → *Network* → ⬇ export). Upload the "
-        "files and the app extracts every embedded search sub-query — same data, "
-        "no console needed."
+        "Alternative: save the loaded AI Mode page (`Ctrl+S` → 'Webpage, HTML Only') "
+        "or export a HAR (`F12` → *Network* → ⬇ export) from **either** google.com "
+        "AI Mode **or** chatgpt.com while the answer streams. Upload the files and "
+        "the app extracts every embedded sub-query, auto-detecting the platform — "
+        "same data, no console needed."
     )
     uploads = st.file_uploader(
         "Upload captures (.html, .har, .txt)",
@@ -784,11 +883,11 @@ with tab_observed:
         manual_rows = []
         for up in uploads:
             queries = parse_capture_file(up.getvalue(), up.name)
-            for q in queries:
+            for q, src in queries.items():
                 manual_rows.append({
                     "query": q,
                     "seed": f"capture: {up.name}",
-                    "source": "ai_mode_observed",
+                    "source": src,
                 })
             st.caption(f"`{up.name}` → {len(queries)} queries extracted")
         if manual_rows:
@@ -804,8 +903,8 @@ with tab_observed:
         st.divider()
         c1, c2, c3 = st.columns(3)
         c1.metric("Observed queries", len(df))
-        c2.metric("Seeds/captures", df["seed"].nunique())
-        c3.metric("Source", "AI Mode (real)")
+        c2.metric("Google AI Mode", int((df["source"] == "ai_mode_observed").sum()))
+        c3.metric("ChatGPT", int((df["source"] == "chatgpt_observed").sum()))
         st.dataframe(df, use_container_width=True, height=380)
         if st.button("🗑 Clear observed data"):
             st.session_state["df_observed"] = pd.DataFrame()
@@ -837,7 +936,8 @@ with tab_results:
         c1.metric("Consolidated total", len(df_all))
         c2.metric("Google Suggest", int((df_all["source"] == "google_suggest").sum()))
         c3.metric("Fan-outs (LLM)", int(df_all["source"].isin(["google_ai_mode", "chatgpt"]).sum()))
-        c4.metric("Observed (AI Mode)", int((df_all["source"] == "ai_mode_observed").sum()))
+        c4.metric("Observed (real)", int(df_all["source"].isin(
+            ["ai_mode_observed", "chatgpt_observed"]).sum()))
 
         search = st.text_input("🔍 Search the consolidated list")
         view = df_all[df_all["query"].str.contains(search, case=False, na=False)] if search else df_all
