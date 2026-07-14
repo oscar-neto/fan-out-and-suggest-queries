@@ -256,40 +256,72 @@ CHATGPT_CONSOLE_SCRIPT = r"""(async () => {
   const conv = await fetch('/backend-api/conversation/' + id, {
     headers: { authorization: 'Bearer ' + s.accessToken }
   }).then(r => r.json());
+
   const qs = new Set();
+  const addQ = (q) => { q = String(q || '').trim(); if (q && q.length <= 120 && !q.startsWith('http')) qs.add(q); };
+
+  // 1) structured fields anywhere in the conversation tree
   const walk = (o) => {
     if (!o || typeof o !== 'object') return;
     if (Array.isArray(o)) { o.forEach(walk); return; }
-    if (Array.isArray(o.search_queries))
-      o.search_queries.forEach(e => { if (e && e.q) qs.add(String(e.q).trim()); });
-    if (typeof o.search_query === 'string') qs.add(o.search_query.trim());
+    for (const key of ['search_query', 'search_queries']) {
+      const v = o[key];
+      if (Array.isArray(v)) v.forEach(e => { if (typeof e === 'string') addQ(e); else if (e && e.q) addQ(e.q); });
+      else if (typeof v === 'string') addQ(v);
+    }
     Object.values(o).forEach(walk);
   };
   walk(conv);
-  // also catch search("...") tool invocations serialized in message parts
+
+  // 2) the model's web.run tool calls are serialized as JSON-strings inside
+  //    message parts: {"search_query":[{"q":"..."}]} - plus legacy search("...").
+  //    Scan the raw serialization (escaped quotes) AND an unescaped variant.
   const raw = JSON.stringify(conv);
-  const re = /search\(\\"((?:[^"\\]|\\.)+?)\\"\)/g;
-  let m; while ((m = re.exec(raw))) qs.add(m[1].replace(/\\"/g, '"').trim());
-  // seed = first user message (chronological)
+  const unesc = (t) => t.split(String.fromCharCode(92) + String.fromCharCode(34)).join(String.fromCharCode(34));
+  for (const text of [raw, unesc(raw)]) {
+    let m;
+    const blockRe = new RegExp('"search_quer(?:y|ies)"' + String.raw`\s*:\s*\[([\s\S]{0,4000}?)\]`, 'g');
+    while ((m = blockRe.exec(text))) {
+      const inner = m[1];
+      if (inner.indexOf('"q"') !== -1) {
+        let qm; const qRe = new RegExp(String.raw`"q"\s*:\s*"((?:[^"\\]|\\.)*?)"`, 'g');
+        while ((qm = qRe.exec(inner))) addQ(unesc(qm[1]));
+      } else {
+        let sm; const sRe = new RegExp(String.raw`"((?:[^"\\]|\\.)+?)"`, 'g');
+        while ((sm = sRe.exec(inner))) addQ(unesc(sm[1]));
+      }
+    }
+    const callRe = new RegExp(String.raw`search\("((?:[^"\\]|\\.)+?)"\)`, 'g');
+    while ((m = callRe.exec(text))) addQ(unesc(m[1]));
+  }
+
+  // exclude the user's own typed prompts - we only want the model's fan-outs
+  const userTexts = new Set();
   const users = Object.values(conv.mapping || {})
-    .map(n => n && n.message).filter(msg =>
-      msg && msg.author && msg.author.role === 'user' && msg.create_time)
-    .sort((a, b) => a.create_time - b.create_time);
+    .map(n => n && n.message)
+    .filter(msg => msg && msg.author && msg.author.role === 'user')
+    .sort((a, b) => (a.create_time || 0) - (b.create_time || 0));
+  users.forEach(msg => {
+    const p = msg.content && msg.content.parts && msg.content.parts[0];
+    if (typeof p === 'string') userTexts.add(p.trim().toLowerCase());
+  });
   let seed = 'chatgpt';
-  if (users.length && users[0].content && users[0].content.parts &&
-      typeof users[0].content.parts[0] === 'string')
-    seed = users[0].content.parts[0].trim().slice(0, 80);
-  const out = [...qs].filter(q => q && q.length <= 120);
+  if (users.length) {
+    const p = users[0].content && users[0].content.parts && users[0].content.parts[0];
+    if (typeof p === 'string' && p.trim()) seed = p.trim().slice(0, 80);
+  }
+  const out = [...qs].filter(q => !userTexts.has(q.toLowerCase()));
+
   const payload = JSON.stringify({ seed: seed, platform: 'chatgpt', queries: out });
   window.__fanout = payload;  // kept for manual copy fallback
   try {
     await navigator.clipboard.writeText(payload);
-    console.log(out.length + ' queries copied to clipboard - paste them back into the app.');
+    console.log(out.length + ' fan-out queries copied to clipboard - paste them back into the app.');
   } catch (e) {
-    // clipboard API may be blocked while DevTools has focus
     console.log(payload);
-    console.log(out.length + ' queries extracted. Clipboard was blocked - either copy the JSON above, or run this one-liner now:  copy(window.__fanout)');
+    console.log(out.length + ' fan-out queries extracted. Clipboard was blocked - copy the JSON above, or run:  copy(window.__fanout)');
   }
+  if (!out.length) console.log('No fan-out queries found. Make sure the answer actually used web search (a sources/citations panel should be visible) - simple prompts may be answered from model knowledge without searching.');
 })();"""
 
 
