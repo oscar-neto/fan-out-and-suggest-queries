@@ -3,7 +3,8 @@
 SEO/GEO opportunity mapping tool with two engines, built with Streamlit:
 
 1. **Google Suggest Miner** — large-scale keyword expansion via Google's autocomplete endpoint, using alphabet soup (a–z), question/commercial/preposition modifiers (pt-BR and en), and optional level-2 recursion.
-2. **Query Fan-out Generator (LLM)** — simulates the query decomposition behavior of **Google AI Mode** (reformulations, related, implicit, comparative, entity expansion) and **ChatGPT** (conversational follow-ups), classifying each fan-out by type and search intent. Works with **either** an Anthropic API key (Claude) **or** a Google AI Studio API key (Gemini) — the user selects the provider in the sidebar and enters whichever key they have.
+2. **Query Fan-out Generator** — one provider selector, two modes, and a dedicated **fan-out language selector** (Brazilian Portuguese, English, Spanish, Mexican Spanish, French, German, Italian) that forces the output language of generated/extracted queries regardless of the seed's language. *Simulated* (Anthropic Claude or Google AI Studio/Gemini key): prompts the model to replicate Google AI Mode decomposition and ChatGPT follow-ups, classified by type and intent. *Real extracted* (OpenAI or Google AI Studio key): runs each seed through the provider's live web search and returns the queries the system actually executed — OpenAI Responses API `web_search_call.action` and Gemini grounding `webSearchQueries`.
+3. **Observed Fan-outs (manual)** — instructions plus ready-to-paste DevTools console scripts to capture the fan-outs exposed by the consumer interfaces themselves (Google AI Mode via `udm=50`, chatgpt.com via the conversation JSON of your own logged-in session), with a JSON paste-parser to bring the results into the dataset.
 
 Results are consolidated, deduplicated, and exportable as CSV or multi-sheet XLSX.
 
@@ -42,4 +43,6 @@ streamlit run app.py
 ## Notes
 
 - The Google Suggest endpoint is undocumented and rate-limited; randomized delays between requests are built in.
+- LLM calls have automatic retry with exponential backoff (up to 4 attempts) for transient errors — 429 (rate limit), 500/502/503 (overloaded), and 529. If a model keeps returning 503 "high demand", switch to a lower-demand model such as `gemini-3.1-flash-lite` in the sidebar.
+- Once a valid API key is entered, the model dropdown is populated live from the provider's ListModels endpoint — only models your key can actually use are shown (cached for 1 hour). Google retires Gemini models frequently and sometimes restricts older ones (e.g. 2.5-series) for new users, so the live list avoids picking unavailable models.
 - LLM fan-outs are synthetic simulations of engine behavior, intended for content-gap and coverage analysis — not an official Google/OpenAI data source.
