@@ -202,20 +202,186 @@ def mine_google_suggest(seeds: list[str], hl: str, gl: str, lang: str,
 
 
 # ---------------------------------------------------------------------------
+# Observed fan-outs — free capture from the real AI Mode interface
+# (DevTools console script + saved HTML / HAR parsing; no external APIs)
+# ---------------------------------------------------------------------------
+
+# matches google search links embedded in HTML/HAR/JSON payloads
+GOOGLE_SEARCH_LINK_RE = re.compile(
+    r"(?:https?:)?(?:\\/\\/|//)(?:www\.)?google\.[a-z.]{2,6}(?:\\/|/)search\?[^\"'\s<>\\]+"
+)
+
+
+def build_ai_mode_url(seed: str, hl: str, gl: str) -> str:
+    """Build the Google AI Mode URL (udm=50) for a seed."""
+    from urllib.parse import quote_plus
+    return (f"https://www.google.com/search?udm=50&q={quote_plus(seed)}"
+            f"&hl={hl}&gl={gl}")
+
+
+CONSOLE_SCRIPT = r"""(() => {
+  const qs = new Set();
+  const grab = (u) => {
+    try {
+      const p = new URL(u, location.origin);
+      if (!p.pathname.includes('/search')) return;
+      const q = p.searchParams.get('q');
+      if (q) qs.add(q.trim());
+    } catch (e) {}
+  };
+  // 1) anchors rendered inside the AI Mode answer
+  document.querySelectorAll('a[href*="/search"]').forEach(a => grab(a.href));
+  // 2) search links embedded in the raw page payload (streamed response data)
+  const re = /(?:\\\/|\/)search\?[^"'\\\s<>]*?q=([^"'&\\\s<>]+)/g;
+  const html = document.documentElement.innerHTML;
+  let m;
+  while ((m = re.exec(html))) {
+    try { qs.add(decodeURIComponent(m[1].replace(/\+/g, ' ')).trim()); } catch (e) {}
+  }
+  const seed = (new URL(location.href)).searchParams.get('q') || '';
+  const out = [...qs].filter(q =>
+    q && q.length <= 120 &&
+    q.toLowerCase() !== seed.toLowerCase() &&
+    !q.startsWith('http') && !q.includes('site:'));
+  copy(JSON.stringify({ seed: seed, queries: out }));
+  console.log(out.length + ' queries copied to clipboard - paste them back into the app.');
+})();"""
+
+
+def parse_pasted_extraction(raw: str) -> list[dict]:
+    """Parse JSON pasted back from the console script.
+    Accepts one or more {seed, queries[]} objects, or plain one-per-line text."""
+    rows = []
+    raw = raw.strip()
+    if not raw:
+        return rows
+    # try to find JSON objects first (user may paste several, one per seed)
+    decoder = json.JSONDecoder()
+    idx, parsed_any = 0, False
+    while idx < len(raw):
+        try:
+            obj, end = decoder.raw_decode(raw, idx)
+        except json.JSONDecodeError:
+            idx += 1
+            continue
+        parsed_any = True
+        idx = end
+        if isinstance(obj, dict):
+            seed = str(obj.get("seed", "")).strip() or "console_extraction"
+            for q in obj.get("queries", []):
+                if isinstance(q, str) and q.strip():
+                    rows.append({"query": q.strip(), "seed": seed,
+                                 "source": "ai_mode_observed"})
+    if not parsed_any:  # fallback: plain lines
+        for line in raw.splitlines():
+            line = line.strip().strip('",')
+            if line:
+                rows.append({"query": line, "seed": "console_extraction",
+                             "source": "ai_mode_observed"})
+    return rows
+
+
+def _clean_embedded_url(raw: str) -> str:
+    """Normalize escaped URLs found inside HTML/JSON payloads."""
+    return (raw.replace("\\/", "/")
+               .replace("\\u0026", "&")
+               .replace("&amp;", "&")
+               .replace("\\u003d", "="))
+
+
+def _q_params_from_url(url: str) -> list[str]:
+    from urllib.parse import urlparse, parse_qs, unquote_plus
+    try:
+        qs = parse_qs(urlparse(url).query)
+        return [unquote_plus(q).strip() for q in qs.get("q", []) if q.strip()]
+    except ValueError:
+        return []
+
+
+def _walk_for_search_queries(obj, found: set):
+    """Recursively scan a JSON structure for embedded google search links."""
+    if isinstance(obj, dict):
+        for v in obj.values():
+            _walk_for_search_queries(v, found)
+    elif isinstance(obj, list):
+        for v in obj:
+            _walk_for_search_queries(v, found)
+    elif isinstance(obj, str) and "google." in obj and "/search" in obj:
+        for m in GOOGLE_SEARCH_LINK_RE.finditer(obj):
+            for q in _q_params_from_url(_clean_embedded_url(m.group(0))):
+                found.add(q)
+
+
+def parse_capture_file(raw_bytes: bytes, filename: str) -> set[str]:
+    """Extract google search queries from a user-captured file
+    (saved AI Mode/SERP HTML, DevTools HAR export, or raw text)."""
+    text = raw_bytes.decode("utf-8", errors="ignore")
+    found: set = set()
+    for m in GOOGLE_SEARCH_LINK_RE.finditer(text):
+        for q in _q_params_from_url(_clean_embedded_url(m.group(0))):
+            found.add(q)
+    # HAR files: also walk the JSON structure (URLs may be split across fields)
+    if filename.lower().endswith(".har"):
+        try:
+            _walk_for_search_queries(json.loads(text), found)
+        except json.JSONDecodeError:
+            pass
+    # drop obvious noise (navigation params, empty, very long payload strings)
+    return {q for q in found if 0 < len(q) <= 120 and not q.startswith(("http", "site:"))}
+
+
+# ---------------------------------------------------------------------------
 # Query fan-out via LLM (Anthropic API or Google AI Studio / Gemini API)
 # ---------------------------------------------------------------------------
 PROVIDERS = {
     "Anthropic (Claude)": {
         "id": "anthropic",
-        "models": ["claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
+        "fallback_models": ["claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
         "key_help": "Get your key at console.anthropic.com",
     },
     "Google AI Studio (Gemini)": {
         "id": "google",
-        "models": ["gemini-2.5-flash", "gemini-flash-latest", "gemini-3.5-flash", "gemini-2.5-pro"],
+        "fallback_models": ["gemini-flash-latest", "gemini-3.5-flash", "gemini-3.1-flash-lite"],
         "key_help": "Get your key at aistudio.google.com/apikey",
     },
 }
+
+# model name fragments that are not text-generation chat models
+_NON_CHAT_FRAGMENTS = ("embedding", "tts", "image", "veo", "imagen",
+                       "live", "audio", "robotics", "aqa")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def list_available_models(provider_id: str, api_key: str) -> list[str]:
+    """Fetch the models actually available to this API key.
+    Raises on failure — caller decides the fallback."""
+    if provider_id == "google":
+        r = requests.get(
+            "https://generativelanguage.googleapis.com/v1beta/models",
+            headers={"x-goog-api-key": api_key},
+            params={"pageSize": 1000},
+            timeout=15,
+        )
+        r.raise_for_status()
+        models = []
+        for m in r.json().get("models", []):
+            if "generateContent" not in m.get("supportedGenerationMethods", []):
+                continue
+            name = m.get("name", "").split("/")[-1]
+            if name and not any(frag in name for frag in _NON_CHAT_FRAGMENTS):
+                models.append(name)
+        # flash models first (cheaper / lower demand), then the rest
+        models.sort(key=lambda n: ("flash" not in n, n))
+        return models
+
+    # anthropic
+    r = requests.get(
+        "https://api.anthropic.com/v1/models",
+        headers={"x-api-key": api_key, "anthropic-version": "2023-06-01"},
+        timeout=15,
+    )
+    r.raise_for_status()
+    return [m["id"] for m in r.json().get("data", [])]
 
 FANOUT_SYSTEM = """You are a query fan-out engine that faithfully replicates the query
 decomposition behavior of two systems:
@@ -373,8 +539,8 @@ def generate_fanouts(seeds: list[str], provider_id: str, api_key: str, lang: str
             status = e.response.status_code if e.response is not None else "?"
             if status in RETRYABLE_STATUS:
                 st.error(f"Seed '{seed}': provider still overloaded after {MAX_RETRIES} retries "
-                         f"({status}). Try again in a few minutes or switch to a stable, "
-                         f"lower-demand model (e.g. gemini-2.5-flash) in the sidebar.")
+                         f"({status}). Try again in a few minutes or pick a different model "
+                         f"in the sidebar (flash models usually have lower demand).")
             else:
                 st.error(f"API error for seed '{seed}': {status} — {e.response.text[:300]}")
         except (requests.RequestException, json.JSONDecodeError, KeyError) as e:
@@ -428,7 +594,30 @@ provider_name = st.sidebar.selectbox("LLM provider", list(PROVIDERS.keys()), ind
 provider = PROVIDERS[provider_name]
 api_key = st.sidebar.text_input(f"{provider_name} API Key", type="password",
                                 help=f"Only required for the fan-out tab. {provider['key_help']}.")
-model = st.sidebar.selectbox("Model", provider["models"], index=0)
+
+model_options = provider["fallback_models"]
+models_are_live = False
+if api_key:
+    try:
+        live_models = list_available_models(provider["id"], api_key)
+        if live_models:
+            model_options = live_models
+            models_are_live = True
+    except requests.HTTPError as e:
+        code = e.response.status_code if e.response is not None else "?"
+        if code in (401, 403):
+            st.sidebar.error("API key rejected by the provider. Check the key and try again.")
+        else:
+            st.sidebar.warning(f"Couldn't fetch the model list ({code}). Using defaults.")
+    except requests.RequestException:
+        st.sidebar.warning("Couldn't reach the provider to list models. Using defaults.")
+
+model = st.sidebar.selectbox(
+    "Model", model_options, index=0,
+    help="Fetched live from your account — only models your key can use."
+         if models_are_live else
+         "Default list — enter a valid API key to load the models available to your account.",
+)
 n_per_type = st.sidebar.slider("Fan-outs per type", 3, 15, 8)
 business_context = st.sidebar.text_area(
     "Business context (optional)",
@@ -453,8 +642,9 @@ seeds = list(dict.fromkeys(seeds))  # dedup preserving order
 if seeds:
     st.caption(f"**{len(seeds)}** seed(s) loaded.")
 
-tab_suggest, tab_fanout, tab_results = st.tabs(
-    ["🅶 Google Suggest Miner", "🤖 Query Fan-out Generator", "📊 Results & Export"]
+tab_suggest, tab_fanout, tab_observed, tab_results = st.tabs(
+    ["🅶 Google Suggest Miner", "🤖 Query Fan-out Generator",
+     "👁 Observed Fan-outs", "📊 Results & Export"]
 )
 
 # ---- Tab 1: Google Suggest ----
@@ -529,12 +719,105 @@ with tab_fanout:
             view = view[view["intent"].isin(int_sel)]
         st.dataframe(view, use_container_width=True, height=420)
 
-# ---- Tab 3: Consolidated results & export ----
+# ---- Tab 3: Observed fan-outs (free capture from the real interface) ----
+with tab_observed:
+    st.markdown(
+        "Captures **real fan-out queries exposed by the Google AI Mode interface** — "
+        "no LLM simulation, no external APIs, no paid tools. After the AI Mode answer "
+        "finishes loading, the executed sub-queries are embedded in the page as search "
+        "links and streamed payload data. Two free routes to extract them from your "
+        "own browsing session:"
+    )
+
+    st.markdown("##### Route 1 — DevTools console script (recommended)")
+    st.markdown(
+        "**Step 1.** Open the AI Mode link for each seed below and wait for the "
+        "answer to fully load (expand sections if shown):"
+    )
+    if seeds:
+        for seed in seeds:
+            st.markdown(f"- [{seed}]({build_ai_mode_url(seed, hl, gl)})")
+    else:
+        st.caption("Add seeds above to generate the AI Mode links.")
+
+    st.markdown(
+        "**Step 2.** Press `F12` → *Console* tab, paste the script below and hit "
+        "Enter. It scans the rendered answer and the streamed payload for embedded "
+        "search queries and copies them to your clipboard as JSON. "
+        "(If the console blocks pasting, type `allow pasting` first — that's a "
+        "Chrome safety prompt.)"
+    )
+    st.code(CONSOLE_SCRIPT, language="javascript")
+
+    st.markdown("**Step 3.** Paste the JSON here (repeat per seed — paste one after the other):")
+    pasted = st.text_area(
+        "Extraction output",
+        placeholder='{"seed": "air fryer", "queries": ["air fryer vs oven", ...]}',
+        height=120,
+        label_visibility="collapsed",
+    )
+    if st.button("➕ Parse & Add", type="primary", disabled=not pasted.strip()):
+        new_rows = parse_pasted_extraction(pasted)
+        if new_rows:
+            df_new = pd.DataFrame(new_rows)
+            prev = st.session_state.get("df_observed", pd.DataFrame())
+            merged = (pd.concat([prev, df_new], ignore_index=True)
+                        .drop_duplicates(subset=["query"], keep="first"))
+            st.session_state["df_observed"] = merged
+            st.success(f"{len(df_new)} queries parsed and added.")
+        else:
+            st.warning("Couldn't parse any queries from the pasted text.")
+
+    st.markdown("##### Route 2 — Saved page / HAR upload")
+    st.caption(
+        "Alternative: on the loaded AI Mode page, save it (`Ctrl+S` → 'Webpage, "
+        "HTML Only') or export a HAR (`F12` → *Network* → ⬇ export). Upload the "
+        "files and the app extracts every embedded search sub-query — same data, "
+        "no console needed."
+    )
+    uploads = st.file_uploader(
+        "Upload captures (.html, .har, .txt)",
+        type=["html", "har", "txt", "mhtml"],
+        accept_multiple_files=True,
+    )
+    if uploads:
+        manual_rows = []
+        for up in uploads:
+            queries = parse_capture_file(up.getvalue(), up.name)
+            for q in queries:
+                manual_rows.append({
+                    "query": q,
+                    "seed": f"capture: {up.name}",
+                    "source": "ai_mode_observed",
+                })
+            st.caption(f"`{up.name}` → {len(queries)} queries extracted")
+        if manual_rows:
+            df_man = pd.DataFrame(manual_rows).drop_duplicates(subset=["query"])
+            prev = st.session_state.get("df_observed", pd.DataFrame())
+            merged = (pd.concat([prev, df_man], ignore_index=True)
+                        .drop_duplicates(subset=["query"], keep="first"))
+            st.session_state["df_observed"] = merged
+            st.success(f"{len(df_man)} queries added from uploaded captures.")
+
+    if "df_observed" in st.session_state and not st.session_state["df_observed"].empty:
+        df = st.session_state["df_observed"]
+        st.divider()
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Observed queries", len(df))
+        c2.metric("Seeds/captures", df["seed"].nunique())
+        c3.metric("Source", "AI Mode (real)")
+        st.dataframe(df, use_container_width=True, height=380)
+        if st.button("🗑 Clear observed data"):
+            st.session_state["df_observed"] = pd.DataFrame()
+            st.rerun()
+
+# ---- Tab 4: Consolidated results & export ----
 with tab_results:
     df_s = st.session_state.get("df_suggest", pd.DataFrame())
     df_f = st.session_state.get("df_fanout", pd.DataFrame())
+    df_o = st.session_state.get("df_observed", pd.DataFrame())
 
-    if df_s.empty and df_f.empty:
+    if df_s.empty and df_f.empty and df_o.empty:
         st.info("Run at least one of the engines to consolidate results here.")
     else:
         frames = []
@@ -542,15 +825,19 @@ with tab_results:
             frames.append(df_s.assign(fanout_type="", intent=""))
         if not df_f.empty:
             frames.append(df_f.assign(expansion_pattern="", level=""))
+        if not df_o.empty:
+            frames.append(df_o.assign(expansion_pattern="", level="",
+                                      fanout_type="", intent=""))
         df_all = pd.concat(frames, ignore_index=True)
         df_all = df_all.drop_duplicates(subset=["query"], keep="first")
         cols = ["query", "seed", "source", "expansion_pattern", "level", "fanout_type", "intent"]
         df_all = df_all[[c for c in cols if c in df_all.columns]]
 
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric("Consolidated total", len(df_all))
         c2.metric("Google Suggest", int((df_all["source"] == "google_suggest").sum()))
         c3.metric("Fan-outs (LLM)", int(df_all["source"].isin(["google_ai_mode", "chatgpt"]).sum()))
+        c4.metric("Observed (AI Mode)", int((df_all["source"] == "ai_mode_observed").sum()))
 
         search = st.text_input("🔍 Search the consolidated list")
         view = df_all[df_all["query"].str.contains(search, case=False, na=False)] if search else df_all
@@ -570,6 +857,8 @@ with tab_results:
             sheets["google_suggest"] = df_s
         if not df_f.empty:
             sheets["llm_fanouts"] = df_f
+        if not df_o.empty:
+            sheets["observed_ai_mode"] = df_o
         d2.download_button(
             "⬇️ Download XLSX (multi-sheet)",
             data=to_xlsx(sheets),
