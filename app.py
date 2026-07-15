@@ -77,6 +77,17 @@ MODIFIERS = {
         ],
         "Prepositions": ["for", "with", "without", "near", "to"],
     },
+    "es": {
+        "Questions": [
+            "cómo", "qué", "cuál", "cuáles", "cuándo", "dónde",
+            "por qué", "para qué", "cuánto cuesta", "vale la pena",
+        ],
+        "Commercial": [
+            "precio", "mejor", "barato", "oferta", "comprar",
+            "vs", "o", "calidad precio", "opiniones", "es bueno",
+        ],
+        "Prepositions": ["para", "con", "sin", "de", "en", "por"],
+    },
 }
 
 SUGGEST_URL = "https://suggestqueries.google.com/complete/search"
@@ -131,10 +142,16 @@ def build_probe_queries(seed: str, lang: str, use_alphabet: bool,
     return probes
 
 
+def _is_excluded(query_lower: str, exclude_terms: list[str]) -> bool:
+    """True when the query contains any excluded term (case-insensitive)."""
+    return any(term in query_lower for term in exclude_terms)
+
+
 def mine_google_suggest(seeds: list[str], hl: str, gl: str, lang: str,
                         use_alphabet: bool, groups: list[str],
                         depth2: bool, depth2_limit: int,
                         delay_range: tuple[float, float],
+                        exclude_terms: list[str] | None = None,
                         progress_cb=None) -> pd.DataFrame:
     """Run the full Google Suggest mining for all seeds."""
     session = requests.Session()
@@ -143,6 +160,7 @@ def mine_google_suggest(seeds: list[str], hl: str, gl: str, lang: str,
                       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
     })
 
+    exclude_terms = [t.lower() for t in (exclude_terms or [])]
     rows = []
     seen: set[str] = set()
 
@@ -160,7 +178,8 @@ def mine_google_suggest(seeds: list[str], hl: str, gl: str, lang: str,
         suggestions = fetch_suggestions(probe, hl, gl, session)
         for s in suggestions:
             key = s.lower().strip()
-            if key and key not in seen and key != seed.lower():
+            if key and key not in seen and key != seed.lower() \
+                    and not _is_excluded(key, exclude_terms):
                 seen.add(key)
                 rows.append({
                     "query": s,
@@ -185,7 +204,8 @@ def mine_google_suggest(seeds: list[str], hl: str, gl: str, lang: str,
             suggestions = fetch_suggestions(sub_seed, hl, gl, session)
             for s in suggestions:
                 key = s.lower().strip()
-                if key and key not in seen:
+                if key and key not in seen \
+                        and not _is_excluded(key, exclude_terms):
                     seen.add(key)
                     rows.append({
                         "query": s,
@@ -742,9 +762,14 @@ def to_xlsx(dfs: dict[str, pd.DataFrame]) -> bytes:
 # ---------------------------------------------------------------------------
 st.sidebar.title("⚙️ Settings")
 
-lang = st.sidebar.selectbox("Expansion language", ["pt-BR", "en"], index=0)
-hl = st.sidebar.text_input("hl (Google interface language)", value="pt-BR" if lang == "pt-BR" else "en")
-gl = st.sidebar.text_input("gl (country)", value="br" if lang == "pt-BR" else "us")
+lang = st.sidebar.selectbox("Expansion language", ["pt-BR", "en", "es"], index=0)
+_HL_DEFAULTS = {"pt-BR": "pt-BR", "en": "en", "es": "es"}
+_GL_DEFAULTS = {"pt-BR": "br", "en": "us", "es": "mx"}
+hl = st.sidebar.text_input("hl (Google interface language)",
+                           value=_HL_DEFAULTS.get(lang, "en"))
+gl = st.sidebar.text_input("gl (country)", value=_GL_DEFAULTS.get(lang, "us"),
+                           help="For Spanish, set the market: mx (Mexico), "
+                                "ar (Argentina), cl (Chile), es (Spain)...")
 
 st.sidebar.divider()
 st.sidebar.subheader("Google Suggest")
@@ -758,6 +783,14 @@ depth2 = st.sidebar.checkbox("Level-2 recursion (suggestions become seeds)", val
 depth2_limit = st.sidebar.slider("Level-2 request cap", 10, 300, 60, step=10,
                                  disabled=not depth2)
 delay = st.sidebar.slider("Delay between requests (seconds)", 0.1, 2.0, (0.2, 0.6))
+exclude_raw = st.sidebar.text_area(
+    "Exclude terms (one per line or comma-separated)",
+    placeholder="electrolux\nbrastemp, samsung",
+    height=80,
+    help="Any Suggest result containing one of these words is dropped from the "
+         "final list — e.g. exclude 'electrolux' to remove 'geladeira electrolux'.",
+)
+exclude_terms = [t.strip().lower() for t in re.split(r"[,\n]", exclude_raw) if t.strip()]
 
 st.sidebar.divider()
 st.sidebar.subheader("Query Fan-out (LLM)")
@@ -851,7 +884,8 @@ with tab_suggest:
         with st.spinner("Mining suggestions..."):
             df_sug = mine_google_suggest(
                 seeds, hl, gl, lang, use_alphabet, groups,
-                depth2, depth2_limit, delay, progress_cb=cb,
+                depth2, depth2_limit, delay,
+                exclude_terms=exclude_terms, progress_cb=cb,
             )
         bar.empty()
         st.session_state["df_suggest"] = df_sug
